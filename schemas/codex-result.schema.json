@@ -124,6 +124,9 @@
           "comment": {
             "type": ["string", "null"]
           },
+          "label": {
+            "type": ["string", "null"]
+          },
           "evidence": {
             "type": "array",
             "items": {

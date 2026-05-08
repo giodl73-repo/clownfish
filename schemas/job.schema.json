@@ -63,6 +63,10 @@
     "allow_fix_pr": {
       "type": "boolean"
     },
+    "allow_label_apply": {
+      "type": "boolean",
+      "description": "When triage_policy is label_untriaged and mode is execute/autonomous, must be true for the applicator to add labels. Mirrors allow_instant_close."
+    },
     "allow_merge": {
       "type": "boolean"
     },
@@ -85,7 +89,17 @@
     },
     "triage_policy": {
       "type": "string",
-      "enum": ["low_signal_prs"]
+      "enum": ["low_signal_prs", "label_untriaged"]
+    },
+    "proposed_label": {
+      "type": "string",
+      "minLength": 1,
+      "description": "When triage_policy is label_untriaged, the single repo label to propose for each candidate. Allowlist-bounded — must already exist on the repo."
+    },
+    "proposed_label_evidence": {
+      "type": "object",
+      "description": "Evidence trail for label_untriaged proposals — surfaces to the maintainer reviewing the proposal. Free-form; the discovery script populates the shape.",
+      "additionalProperties": true
     },
     "notes": {
       "type": "string"

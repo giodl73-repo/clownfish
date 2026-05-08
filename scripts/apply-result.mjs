@@ -16,6 +16,7 @@ const CLOSE_ACTIONS = new Set([
   "post_merge_close",
 ]);
 const MERGE_ACTIONS = new Set(["merge_candidate", "merge_canonical"]);
+const LABEL_ACTIONS = new Set(["label"]);
 const CLOSE_CLASSIFICATIONS = new Set(["duplicate", "superseded", "fixed_by_candidate", "low_signal"]);
 const PASSING_CHECK_CONCLUSIONS = new Set(["SUCCESS", "SKIPPED", "NEUTRAL"]);
 const CLEAN_MERGE_STATES = new Set(["CLEAN"]);
@@ -98,7 +99,18 @@ const maintainerCloseRefs = new Set(
 
 for (const action of result.actions ?? []) {
   if (!isApplicatorAction(action)) continue;
-  report.actions.push(applyAction({ job, result, action, dryRun, allowMissingUpdatedAt }));
+  // Convert thrown errors into structured `failed` results so a single
+  // non-retryable gh failure does not abandon the rest of the batch.
+  try {
+    report.actions.push(applyAction({ job, result, action, dryRun, allowMissingUpdatedAt }));
+  } catch (error) {
+    report.actions.push({
+      target: typeof action.target === "string" ? action.target : null,
+      action: typeof action.action === "string" ? action.action : null,
+      status: "failed",
+      reason: commandErrorText(error),
+    });
+  }
 }
 
 const reportPath =
@@ -164,6 +176,9 @@ function applyAction({ job, result, action, dryRun, allowMissingUpdatedAt }) {
   }
   if (MERGE_ACTIONS.has(actionName)) {
     return applyMergeAction({ job, result, action, dryRun, allowMissingUpdatedAt, target, base });
+  }
+  if (LABEL_ACTIONS.has(actionName)) {
+    return applyLabelAction({ job, result, action, dryRun, allowMissingUpdatedAt, target, base });
   }
   if (!CLOSE_ACTIONS.has(actionName)) {
     return { ...base, status: "skipped", reason: "action is not an applicator action" };
@@ -445,6 +460,152 @@ function applyMergeAction({ job, result, action, dryRun, allowMissingUpdatedAt, 
   };
 }
 
+function applyLabelAction({ job, result, action, dryRun, allowMissingUpdatedAt, target, base }) {
+  const policyBlock = validateLabelPolicy({ job, action });
+  if (policyBlock) return { ...base, status: "blocked", reason: policyBlock };
+
+  if (!job.frontmatter.candidates.map(normalizeIssueRef).includes(target)) {
+    return { ...base, status: "blocked", reason: "target is not listed in job candidates" };
+  }
+
+  const proposedLabel = String(job.frontmatter.proposed_label ?? "").trim();
+  const requestedLabel = String(action.label ?? "").trim();
+  if (!proposedLabel) {
+    return { ...base, status: "blocked", reason: "job is missing proposed_label" };
+  }
+  if (!requestedLabel) {
+    return { ...base, status: "blocked", reason: "label action is missing label field" };
+  }
+  if (requestedLabel !== proposedLabel) {
+    return {
+      ...base,
+      status: "blocked",
+      reason: `action label '${requestedLabel}' does not match job proposed_label '${proposedLabel}'`,
+    };
+  }
+
+  const live = fetchIssue(result.repo, target);
+
+  if (hasSecuritySignal(live)) {
+    return {
+      ...base,
+      status: "blocked",
+      reason: "security-sensitive target requires central security triage",
+      live_state: live.state,
+    };
+  }
+
+  if (live.state !== "open") {
+    return {
+      ...base,
+      status: "skipped",
+      reason: `target is ${live.state}`,
+      live_state: live.state,
+    };
+  }
+
+  if (live.pull_request) {
+    return {
+      ...base,
+      status: "blocked",
+      reason: "label apply requires issue target_kind, not pull request",
+      live_state: live.state,
+    };
+  }
+
+  const humanAssignees = (live.assignees ?? []).filter((entry) => entry?.type !== "Bot");
+  if (humanAssignees.length > 0) {
+    return {
+      ...base,
+      status: "blocked",
+      reason: "issue has been assigned since proposal; no longer untriaged",
+      live_state: live.state,
+    };
+  }
+
+  const expectedUpdatedAt = action.target_updated_at ?? action.live_updated_at;
+  if (!expectedUpdatedAt && !allowMissingUpdatedAt) {
+    return {
+      ...base,
+      status: "blocked",
+      reason: "missing target_updated_at; rerun the worker against live GitHub state",
+      live_state: live.state,
+      live_updated_at: live.updated_at,
+    };
+  }
+  if (expectedUpdatedAt && expectedUpdatedAt !== live.updated_at) {
+    return {
+      ...base,
+      status: "blocked",
+      reason: "target changed since worker review",
+      expected_updated_at: expectedUpdatedAt,
+      live_updated_at: live.updated_at,
+      live_state: live.state,
+    };
+  }
+
+  const liveLabels = (live.labels ?? [])
+    .map((entry) => (typeof entry === "string" ? entry : entry?.name))
+    .filter((name) => typeof name === "string" && name.length > 0);
+  if (liveLabels.includes(proposedLabel)) {
+    return {
+      ...base,
+      status: "executed",
+      reason: "label already applied",
+      live_state: live.state,
+      live_updated_at: live.updated_at,
+      label: proposedLabel,
+    };
+  }
+
+  if (dryRun) {
+    return {
+      ...base,
+      status: "planned",
+      reason: "dry run",
+      live_state: live.state,
+      live_updated_at: live.updated_at,
+      label: proposedLabel,
+    };
+  }
+
+  try {
+    ghWithRetry(["issue", "edit", String(target), "--repo", result.repo, "--add-label", proposedLabel]);
+  } catch (error) {
+    const detail = commandErrorText(error);
+    if (/not found|could not add label/i.test(detail)) {
+      return {
+        ...base,
+        status: "blocked",
+        reason: `label '${proposedLabel}' no longer exists on repo`,
+        live_state: live.state,
+        live_updated_at: live.updated_at,
+      };
+    }
+    throw error;
+  }
+
+  return {
+    ...base,
+    status: "executed",
+    reason: `applied label '${proposedLabel}'`,
+    live_state: live.state,
+    live_updated_at: live.updated_at,
+    label: proposedLabel,
+  };
+}
+
+function validateLabelPolicy({ job, action }) {
+  if (job.frontmatter.triage_policy !== "label_untriaged") {
+    return "label apply requires triage_policy: label_untriaged";
+  }
+  if (!job.frontmatter.allowed_actions.includes("label")) return "job does not allow label";
+  if ((job.frontmatter.blocked_actions ?? []).includes("label")) return "label is blocked by job frontmatter";
+  if (job.frontmatter.allow_label_apply !== true) return "label apply requires allow_label_apply: true";
+  if (String(action.action ?? "") !== "label") return "unsupported label action";
+  return "";
+}
+
 function validateClosePolicy({ job, actionName }) {
   if (!job.frontmatter.allowed_actions.includes("close")) return "job does not allow close";
   if (!job.frontmatter.allowed_actions.includes("comment")) return "job does not allow close comments";
@@ -661,7 +822,8 @@ function validateStatusChecks(checks) {
 }
 
 function isApplicatorAction(action) {
-  return CLOSE_ACTIONS.has(String(action?.action ?? "")) || MERGE_ACTIONS.has(String(action?.action ?? ""));
+  const name = String(action?.action ?? "");
+  return CLOSE_ACTIONS.has(name) || MERGE_ACTIONS.has(name) || LABEL_ACTIONS.has(name);
 }
 
 function normalizeIssueRef(value, expectedRepo = "") {
@@ -752,7 +914,8 @@ function validateLowSignalIntent({ job, action, actionName, classification }) {
 function validateLowSignalLiveState(repo, target, live, kind) {
   if (kind !== "pull_request") return "low-signal cleanup may only close pull requests";
   if (hasSecuritySignal(live)) return "security-sensitive target requires human triage";
-  if (Array.isArray(live.assignees) && live.assignees.length > 0) {
+  const humanAssignees = (live.assignees ?? []).filter((entry) => entry?.type !== "Bot");
+  if (humanAssignees.length > 0) {
     return "assigned PR has maintainer/human signal";
   }
 

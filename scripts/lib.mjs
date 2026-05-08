@@ -333,6 +333,7 @@ export function validateJob(job) {
     "allow_instant_close",
     "allow_low_signal_pr_close",
     "allow_fix_pr",
+    "allow_label_apply",
     "allow_merge",
     "allow_unmerged_fix_close",
     "allow_post_merge_close",
@@ -363,6 +364,28 @@ export function validateJob(job) {
   }
   if (fm.security_sensitive === true) {
     errors.push("security_sensitive jobs are out of scope for ProjectClownfish; route them to central security triage");
+  }
+
+  // label_untriaged-specific invariants. proposed_label is the single
+  // label the worker validates per-candidate and the applicator
+  // enforces equality on; missing it means there's nothing to apply.
+  // allowed_actions must be exactly ["label"] — close/comment/merge are
+  // out of scope for this policy. Execute/autonomous mode requires the
+  // explicit allow_label_apply gate (mirrors allow_instant_close).
+  if (fm.triage_policy === "label_untriaged") {
+    if (typeof fm.proposed_label !== "string" || fm.proposed_label.trim() === "") {
+      errors.push("triage_policy: label_untriaged requires proposed_label");
+    }
+    for (const action of fm.allowed_actions ?? []) {
+      if (action !== "label") {
+        errors.push(`triage_policy: label_untriaged only allows the 'label' action; got '${action}'`);
+      }
+    }
+    if (["execute", "autonomous"].includes(fm.mode) && fm.allow_label_apply !== true) {
+      errors.push(
+        "triage_policy: label_untriaged in execute/autonomous mode requires allow_label_apply: true",
+      );
+    }
   }
 
   return errors;
@@ -401,6 +424,9 @@ export function renderPrompt(job, requestedMode, context = {}) {
     readText("instructions/merge-policy.md"),
     ...(job.frontmatter.triage_policy === "low_signal_prs"
       ? ["## Low-signal PR policy", readText("instructions/low-signal-prs.md")]
+      : []),
+    ...(job.frontmatter.triage_policy === "label_untriaged"
+      ? ["## Label-untriaged policy", readText("instructions/label-untriaged.md")]
       : []),
     "## Job file",
     "```md",
